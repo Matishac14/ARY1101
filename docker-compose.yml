@@ -1,0 +1,82 @@
+services:
+
+  db:
+    image: mysql:8.0
+    container_name: technova-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpass}
+      MYSQL_DATABASE:      ${DB_NAME:-technova}
+      MYSQL_USER:          ${DB_USER:-technova_user}
+      MYSQL_PASSWORD:      ${DB_PASSWORD:-technova_pass}
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./technova-db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - technova-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-rootpass}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - technova-net
+
+  api-productos:
+    build:
+      context: technova-api-productos
+      dockerfile: technova-api-productos/Dockerfile
+    container_name: technova-api-productos
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: db
+      PORT: ${PORT_PRODUCTOS:-3001}
+    ports:
+      - "${PORT_PRODUCTOS:-3001}:3001"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - technova-net
+
+  api-pedidos:
+    build:
+      context: technova-api-pedidos
+      dockerfile: technova-api-pedidos/Dockerfile
+    container_name: technova-api-pedidos
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_HOST: db
+      PORT: ${PORT_PEDIDOS:-3002}
+    ports:
+      - "${PORT_PEDIDOS:-3002}:3002"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - technova-net
+
+  frontend:
+    build:
+      context: technova-frontend
+      dockerfile: technova-frontend/Dockerfile
+    container_name: technova-frontend
+    restart: unless-stopped
+    ports:
+      - "${PORT_FRONTEND:-80}:80"
+    depends_on:
+      - api-productos
+      - api-pedidos
+    networks:
+      - technova-net
+
+volumes:
+  technova-db-data:
+
+networks:
+  technova-net:
+    driver: bridge
