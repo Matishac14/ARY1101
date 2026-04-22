@@ -18,7 +18,7 @@ variable "alumno" {
 
 variable "rut_db" {
   description = "Dígitos del RUT para nombre de BD"
-  default     = "12345678"
+  default     = "20099194k"
 }
 
 data "aws_caller_identity" "current" {}
@@ -244,7 +244,7 @@ resource "aws_db_instance" "mysql" {
 }
 
 resource "aws_secretsmanager_secret" "db_creds" {
-  name = "technova/db-${var.alumno}-v7" # Iteración segura
+  name = "technova/db-${var.alumno}-v1" # Iteración segura
 }
 
 resource "aws_secretsmanager_secret_version" "db_creds" {
