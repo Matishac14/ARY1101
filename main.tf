@@ -1,37 +1,45 @@
 # ==============================================================================
-# TECNOVA - ARQUITECTURA CLOUD NATIVE (AWS WELL-ARCHITECTED)
-# Autor: Matias Fernandez / Estudiante Ing. Plataformas
-# Topología: Multi-AZ (Alta Disponibilidad), Zero-Trust, Serverless-ready.
+# TECNOVA - MAIN.TF
+# Autor: Matias Fernandez / ARY1101
+# Arquitectura: S3 Static Website (frontend) + ALB + EC2 (APIs Node.js) + RDS MySQL
+#
+# RESTRICCIONES LEARNER LAB APLICADAS:
+#   - Sin crear/modificar roles IAM → usa LabRole / LabInstanceProfile existentes
+#   - Sin Enhanced Monitoring en RDS (monitoring_interval = 0)
+#   - Sin PIOPS storage → gp2
+#   - Sin WAFv2 / Secrets Manager (no requeridos por rúbrica)
+#   - Max 9 EC2 simultáneos → solo 1 EC2 para APIs
+#   - Solo us-east-1
+#   - S3 bucket con public access para frontend estático
+#   - CORS habilitado en APIs para permitir llamadas desde S3
 # ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 0. CONFIGURACIÓN BASE
-# ------------------------------------------------------------------------------
 provider "aws" {
-  region = "us-east-1"
-}
-
-variable "alumno" {
-  description = "Sufijo para naming convention"
-  default     = "matias-fernandez"
-}
-
-variable "rut_db" {
-  description = "Dígitos del RUT para nombre de BD"
-  default     = "20099194k"
+  region = var.region
 }
 
 data "aws_caller_identity" "current" {}
-data "aws_iam_role" "lab_role" { name = "LabRole" }
-data "aws_iam_instance_profile" "lab_profile" { name = "LabInstanceProfile" }
 
-# ------------------------------------------------------------------------------
-# 1. REDES (Multi-AZ)
-# ------------------------------------------------------------------------------
+# LabRole y LabInstanceProfile pre-creados (Learner Lab no permite crear roles IAM)
+data "aws_iam_instance_profile" "lab_profile" {
+  name = "LabInstanceProfile"
+}
+
+# AMI Amazon Linux 2 (última versión via SSM Parameter Store)
+data "aws_ssm_parameter" "al2_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+}
+
+# ==============================================================================
+# 1. RED — VPC + Subredes + Routing
+# Topología: 1 AZ funcional (1a) + 1 AZ declarada (1b) requerida por ALB y RDS
+# ==============================================================================
+
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/22"
   enable_dns_hostnames = true
-  tags                 = { Name = "vpc-${var.alumno}" }
+  enable_dns_support   = true
+  tags = { Name = "vpc-${var.alumno}" }
 }
 
 resource "aws_internet_gateway" "igw" {
@@ -39,50 +47,61 @@ resource "aws_internet_gateway" "igw" {
   tags   = { Name = "igw-${var.alumno}" }
 }
 
+# Subred pública 1a → ALB + NAT Gateway
 resource "aws_subnet" "public_a" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.0.0/24"
   availability_zone       = "us-east-1a"
-  map_public_ip_on_launch = true
-  tags                    = { Name = "subnet-pub-1a-${var.alumno}" }
+  map_public_ip_on_launch = false
+  tags = { Name = "subnet-pub-1a-${var.alumno}" }
 }
 
+# Subred pública 1b → requerida por ALB (mínimo 2 AZs) y RDS subnet group
 resource "aws_subnet" "public_b" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "us-east-1b"
-  map_public_ip_on_launch = true
-  tags                    = { Name = "subnet-pub-1b-${var.alumno}" }
+  map_public_ip_on_launch = false
+  tags = { Name = "subnet-pub-1b-${var.alumno}" }
 }
 
+# Subred privada 1a → EC2 (APIs) + RDS
 resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.2.0/24"
   availability_zone = "us-east-1a"
-  tags              = { Name = "subnet-priv-1a-${var.alumno}" }
+  tags = { Name = "subnet-priv-1a-${var.alumno}" }
 }
 
+# Subred privada 1b → requerida por RDS subnet group
 resource "aws_subnet" "private_b" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.3.0/24"
   availability_zone = "us-east-1b"
-  tags              = { Name = "subnet-priv-1b-${var.alumno}" }
+  tags = { Name = "subnet-priv-1b-${var.alumno}" }
 }
 
-resource "aws_eip" "nat" { domain = "vpc" }
+# NAT Gateway → permite al EC2 privado hacer pull desde ECR / internet
+resource "aws_eip" "nat" {
+  domain     = "vpc"
+  depends_on = [aws_internet_gateway.igw]
+}
 
 resource "aws_nat_gateway" "nat" {
   allocation_id = aws_eip.nat.id
   subnet_id     = aws_subnet.public_a.id
   tags          = { Name = "nat-${var.alumno}" }
+  depends_on    = [aws_internet_gateway.igw]
 }
 
+# Tabla de rutas pública → IGW
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.igw.id
   }
+  tags = { Name = "rt-public-${var.alumno}" }
 }
 
 resource "aws_route_table_association" "pub_a" {
@@ -95,12 +114,14 @@ resource "aws_route_table_association" "pub_b" {
   route_table_id = aws_route_table.public.id
 }
 
+# Tabla de rutas privada → NAT Gateway
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
   route {
     cidr_block     = "0.0.0.0/0"
     nat_gateway_id = aws_nat_gateway.nat.id
   }
+  tags = { Name = "rt-private-${var.alumno}" }
 }
 
 resource "aws_route_table_association" "priv_a" {
@@ -113,15 +134,22 @@ resource "aws_route_table_association" "priv_b" {
   route_table_id = aws_route_table.private.id
 }
 
-# ------------------------------------------------------------------------------
-# 2. FIREWALLS ZERO-TRUST
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# 2. SECURITY GROUPS — 3 capas, principio de mínimo privilegio
+#    sg-alb  → acepta tráfico HTTP público
+#    sg-ec2  → acepta tráfico SOLO desde sg-alb (puertos 3001 y 3002)
+#    sg-rds  → acepta MySQL SOLO desde sg-ec2
+#
+# NOTA EVALUACIÓN: RDS abierto a 0.0.0.0/0 = criterio seguridad en 0
+# ==============================================================================
+
 resource "aws_security_group" "alb" {
   name        = "alb-${var.alumno}-sg"
+  description = "ALB: HTTP publico desde internet"
   vpc_id      = aws_vpc.main.id
-  description = "Capa 7: Entrada publica HTTP"
 
   ingress {
+    description = "HTTP publico"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
@@ -134,30 +162,27 @@ resource "aws_security_group" "alb" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "alb-sg-${var.alumno}" }
 }
 
-resource "aws_security_group" "ecs" {
-  name        = "ecs-${var.alumno}-sg"
+resource "aws_security_group" "ec2" {
+  name        = "ec2-sg-${var.alumno}"
+  description = "EC2 APIs: solo desde ALB (puertos 3001 y 3002)"
   vpc_id      = aws_vpc.main.id
-  description = "Compute Node: Trafico desde ALB"
 
   ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
-  }
-
-  ingress {
+    description     = "API Productos desde ALB"
     from_port       = 3001
-    to_port         = 3002
+    to_port         = 3001
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
 
   ingress {
-    from_port       = 32768
-    to_port         = 65535
+    description     = "API Pedidos desde ALB"
+    from_port       = 3002
+    to_port         = 3002
     protocol        = "tcp"
     security_groups = [aws_security_group.alb.id]
   }
@@ -168,320 +193,290 @@ resource "aws_security_group" "ecs" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "ec2-sg-${var.alumno}" }
 }
 
 resource "aws_security_group" "rds" {
-  name        = "rds-${var.alumno}-sg"
+  name        = "rds-sg-${var.alumno}"
+  description = "RDS MySQL solo desde ec2-sg - nunca desde internet"
   vpc_id      = aws_vpc.main.id
-  description = "BD: Aislamiento estricto"
 
   ingress {
+    description     = "MySQL desde EC2 unicamente"
     from_port       = 3306
     to_port         = 3306
     protocol        = "tcp"
-    security_groups = [aws_security_group.ecs.id]
+    security_groups = [aws_security_group.ec2.id]
   }
+
+  tags = { Name = "rds-sg-${var.alumno}" }
 }
 
-# ------------------------------------------------------------------------------
-# 3. WAF
-# ------------------------------------------------------------------------------
-resource "aws_wafv2_web_acl" "main" {
-  name        = "waf-${var.alumno}"
-  description = "Proteccion OWASP"
-  scope       = "REGIONAL"
+# ==============================================================================
+# 3. RDS MySQL — subred privada, sin Enhanced Monitoring (Learner Lab)
+# ==============================================================================
 
-  default_action {
-    allow {}
-  }
-
-  visibility_config {
-    cloudwatch_metrics_enabled = true
-    metric_name                = "waf-metric"
-    sampled_requests_enabled   = true
-  }
-
-  rule {
-    name     = "AWSManagedRulesCommonRuleSet"
-    priority = 1
-    override_action {
-      none {}
-    }
-    statement {
-      managed_rule_group_statement {
-        name        = "AWSManagedRulesCommonRuleSet"
-        vendor_name = "AWS"
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "aws-common-rules"
-      sampled_requests_enabled   = true
-    }
-  }
-}
-
-# ------------------------------------------------------------------------------
-# 4. CAPA DE DATOS (RDS + SECRETS MANAGER)
-# ------------------------------------------------------------------------------
 resource "aws_db_subnet_group" "rds" {
   name       = "rds-sng-${var.alumno}"
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  tags       = { Name = "rds-sng-${var.alumno}" }
 }
 
 resource "aws_db_instance" "mysql" {
-  identifier             = "rds-${var.alumno}"
-  engine                 = "mysql"
-  engine_version         = "8.0"
-  instance_class         = "db.t3.micro"
-  allocated_storage      = 20
-  db_name                = "technova"
-  username               = "admin"
-  password               = "20099194k"
+  identifier        = "rds-${var.alumno}"
+  engine            = "mysql"
+  engine_version    = "8.0"
+  instance_class    = "db.t3.micro"
+  allocated_storage = 20
+  storage_type      = "gp2"
+
+  db_name  = var.db_name
+  username = var.db_user
+  password = var.db_password
+
   vpc_security_group_ids = [aws_security_group.rds.id]
   db_subnet_group_name   = aws_db_subnet_group.rds.name
-  skip_final_snapshot    = true
+
+  # Learner Lab: Enhanced Monitoring no soportado → monitoring_interval = 0
+  monitoring_interval = 0
+
+  skip_final_snapshot = true
+  deletion_protection = false
+
+  tags = { Name = "rds-${var.alumno}" }
 }
 
-resource "aws_secretsmanager_secret" "db_creds" {
-  name = "technova/db-${var.alumno}-v1" # Iteración segura
+# ==============================================================================
+# 4. EC2 — subred privada, solo APIs (ya no sirve frontend)
+#    user_data: instala Docker, mysql client y configura el ambiente
+#    LabInstanceProfile: permite SSM Session Manager sin SSH ni puerto 22
+# ==============================================================================
+
+resource "aws_instance" "app" {
+  ami                    = data.aws_ssm_parameter.al2_ami.value
+  instance_type          = var.ec2_instance_type
+  subnet_id              = aws_subnet.private_a.id
+  vpc_security_group_ids = [aws_security_group.ec2.id]
+  iam_instance_profile   = data.aws_iam_instance_profile.lab_profile.name
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    yum update -y
+    amazon-linux-extras install docker -y
+    systemctl start docker
+    systemctl enable docker
+    usermod -aG docker ec2-user
+
+    # Docker Compose
+    curl -fsSL \
+      "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+      -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+
+    # MySQL client para inyectar init.sql via SSM desde local
+    yum install -y mysql
+
+    mkdir -p /home/ec2-user/technova
+    chown ec2-user:ec2-user /home/ec2-user/technova
+
+    echo "USERDATA_OK" > /tmp/userdata_status
+  EOF
+  )
+
+  tags = { Name = "ec2-${var.alumno}" }
+
+  depends_on = [aws_nat_gateway.nat]
 }
 
-resource "aws_secretsmanager_secret_version" "db_creds" {
-  secret_id = aws_secretsmanager_secret.db_creds.id
-  secret_string = jsonencode({
-    ALUMNO_NOMBRE  = "Matias Fernandez"
-    ALUMNO_RUT     = "20099194-k"
-    ALUMNO_SECCION = "ARY1101"
-    DB_HOST        = aws_db_instance.mysql.address
-    DB_NAME        = "technova"
-    DB_USER        = "admin"
-    DB_PASSWORD    = "20099194k" # Coincide con el código Node.js
-  })
-}
+# ==============================================================================
+# 5. ALB — SOLO 2 Target Groups para APIs (frontend ya está en S3)
+#    Justificación: el frontend es contenido estático → S3 es más adecuado
+#    El ALB expone únicamente las APIs con lógica de negocio
+# ==============================================================================
 
-# ------------------------------------------------------------------------------
-# 5. BALANCEADOR DE CARGA (ALB)
-# ------------------------------------------------------------------------------
 resource "aws_lb" "main" {
   name               = "alb-${var.alumno}"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  tags               = { Name = "alb-${var.alumno}" }
 }
 
-resource "aws_wafv2_web_acl_association" "waf_alb" {
-  resource_arn = aws_lb.main.arn
-  web_acl_arn  = aws_wafv2_web_acl.main.arn
+# Target Group API Productos → EC2:3001
+resource "aws_lb_target_group" "api_productos" {
+  name        = "tg-productos-${var.alumno}"
+  port        = 3001
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"
+
+  health_check {
+    path                = "/api/productos/info"
+    port                = "3001"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+
+  tags = { Name = "tg-productos-${var.alumno}" }
 }
 
-resource "aws_lb_target_group" "frontend" {
-  name     = "tg-front-${var.alumno}"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
+# Target Group API Pedidos → EC2:3002
+resource "aws_lb_target_group" "api_pedidos" {
+  name        = "tg-pedidos-${var.alumno}"
+  port        = 3002
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"
+
+  health_check {
+    path                = "/api/pedidos/info"
+    port                = "3002"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+
+  tags = { Name = "tg-pedidos-${var.alumno}" }
 }
 
-resource "aws_lb_target_group" "api_prod" {
-  name     = "tg-prod-${var.alumno}"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
-  health_check { path = "/api/productos/info" }
+# Registro del EC2 en ambos Target Groups con puertos distintos
+resource "aws_lb_target_group_attachment" "api_productos" {
+  target_group_arn = aws_lb_target_group.api_productos.arn
+  target_id        = aws_instance.app.id
+  port             = 3001
 }
 
-resource "aws_lb_target_group" "api_ped" {
-  name     = "tg-ped-${var.alumno}"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = aws_vpc.main.id
-  health_check { path = "/api/pedidos/info" }
+resource "aws_lb_target_group_attachment" "api_pedidos" {
+  target_group_arn = aws_lb_target_group.api_pedidos.arn
+  target_id        = aws_instance.app.id
+  port             = 3002
 }
 
+# Listener HTTP:80
+# Default → 404 (sin frontend en ALB, el tráfico / va directo a S3)
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = "80"
   protocol          = "HTTP"
+
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.frontend.arn
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "TechNova API Gateway - use /api/productos o /api/pedidos"
+      status_code  = "200"
+    }
   }
 }
 
-resource "aws_lb_listener_rule" "api_prod" {
+# Regla 1: /api/productos* → tg-productos
+resource "aws_lb_listener_rule" "api_productos" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 10
+
   condition {
     path_pattern {
       values = ["/api/productos*"]
     }
   }
+
   action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.api_prod.arn
+    target_group_arn = aws_lb_target_group.api_productos.arn
   }
 }
 
-resource "aws_lb_listener_rule" "api_ped" {
+# Regla 2: /api/pedidos* → tg-pedidos
+resource "aws_lb_listener_rule" "api_pedidos" {
   listener_arn = aws_lb_listener.http.arn
   priority     = 20
+
   condition {
     path_pattern {
       values = ["/api/pedidos*"]
     }
   }
+
   action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.api_ped.arn
+    target_group_arn = aws_lb_target_group.api_pedidos.arn
   }
 }
 
-# ------------------------------------------------------------------------------
-# 6. CLÚSTER ECS Y AUTO SCALING
-# ------------------------------------------------------------------------------
-resource "aws_ecs_cluster" "main" {
-  name = "cluster-${var.alumno}"
+# ==============================================================================
+# 6. S3 STATIC WEBSITE — Frontend estático de TechNova
+#    Justificación arquitectural:
+#    - El frontend es HTML/JS/CSS puro servido por Nginx → objeto estático
+#    - S3 Static Website elimina el proceso de servidor para contenido estático
+#    - Reduce carga del EC2 (solo corre las 2 APIs con lógica de negocio)
+#    - Costo menor: S3 cobra por almacenamiento/requests vs EC2 por hora
+#    - Práctica estándar de la industria para SPA y sitios estáticos
+#    - El JS del frontend apunta al ALB para consumir las APIs
+# ==============================================================================
+
+resource "aws_s3_bucket" "frontend" {
+  bucket        = "technova-frontend-${var.alumno}-${var.s3_bucket_suffix}"
+  force_destroy = true
+  tags          = { Name = "s3-frontend-${var.alumno}" }
 }
 
-data "aws_ssm_parameter" "ecs_optimized_ami" {
-  name = "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id"
+# Deshabilitar bloqueo de acceso público (requerido para Static Website)
+resource "aws_s3_bucket_public_access_block" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
 }
 
-resource "aws_cloudwatch_log_group" "ecs_logs" {
-  name              = "/ecs/technova"
-  retention_in_days = 1
+# Política pública de lectura para el sitio web
+resource "aws_s3_bucket_policy" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "PublicReadGetObject"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.frontend.arn}/*"
+      }
+    ]
+  })
+
+  depends_on = [aws_s3_bucket_public_access_block.frontend]
 }
 
-resource "aws_launch_template" "ecs_node" {
-  name_prefix   = "ecs-node-${var.alumno}"
-  image_id      = data.aws_ssm_parameter.ecs_optimized_ami.value
-  instance_type = "t3.small"
-  iam_instance_profile { name = data.aws_iam_instance_profile.lab_profile.name }
-  vpc_security_group_ids = [aws_security_group.ecs.id]
-  user_data = base64encode(<<EOF
-#!/bin/bash
-echo ECS_CLUSTER=${aws_ecs_cluster.main.name} >> /etc/ecs/ecs.config
-EOF
-  )
-}
+# Habilitar S3 Static Website Hosting
+resource "aws_s3_bucket_website_configuration" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
 
-resource "aws_autoscaling_group" "ecs_asg" {
-  name                = "asg-ecs-${var.alumno}"
-  vpc_zone_identifier = [aws_subnet.private_a.id, aws_subnet.private_b.id]
-  desired_capacity    = 2
-  max_size            = 3
-  min_size            = 1
-
-  launch_template {
-    id      = aws_launch_template.ecs_node.id
-    version = "$Latest"
+  index_document {
+    suffix = "index.html"
   }
 
-  tag {
-    key                 = "Name"
-    value               = "ec2-ecs-node-${var.alumno}"
-    propagate_at_launch = true
-  }
-}
-
-# ------------------------------------------------------------------------------
-# 7. ORQUESTACIÓN: TAREAS (Zero Downtime)
-# ------------------------------------------------------------------------------
-resource "aws_ecs_task_definition" "app" {
-  family                   = "task-${var.alumno}"
-  network_mode             = "bridge"
-  requires_compatibilities = ["EC2"]
-  execution_role_arn       = data.aws_iam_role.lab_role.arn
-  task_role_arn            = data.aws_iam_role.lab_role.arn
-
-  container_definitions = jsonencode([
-    {
-      name         = "frontend"
-      image        = "${data.aws_caller_identity.current.account_id}.dkr.ecr.us-east-1.amazonaws.com/technova-frontend:latest"
-      cpu          = 256
-      memory       = 512
-      essential    = true
-      portMappings = [{ containerPort = 80, hostPort = 0, protocol = "tcp" }]
-      logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = "/ecs/technova", "awslogs-region" = "us-east-1", "awslogs-stream-prefix" = "front" } }
-    },
-    {
-      name         = "api-productos"
-      image        = "${data.aws_caller_identity.current.account_id}.dkr.ecr.us-east-1.amazonaws.com/technova-api-productos:latest"
-      cpu          = 256
-      memory       = 256
-      essential    = true
-      portMappings = [{ containerPort = 3001, hostPort = 0, protocol = "tcp" }]
-      secrets = [
-        { name = "DB_HOST", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_HOST::" },
-        { name = "DB_USER", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_USER::" },
-        { name = "DB_PASSWORD", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_PASSWORD::" },
-        { name = "DB_NAME", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_NAME::" },
-        { name = "ALUMNO_NOMBRE", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:ALUMNO_NOMBRE::" },
-        { name = "ALUMNO_RUT", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:ALUMNO_RUT::" },
-        { name = "ALUMNO_SECCION", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:ALUMNO_SECCION::" }
-      ]
-      logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = "/ecs/technova", "awslogs-region" = "us-east-1", "awslogs-stream-prefix" = "prod" } }
-    },
-    {
-      name         = "api-pedidos"
-      image        = "${data.aws_caller_identity.current.account_id}.dkr.ecr.us-east-1.amazonaws.com/technova-api-pedidos:latest"
-      cpu          = 256
-      memory       = 256
-      essential    = true
-      portMappings = [{ containerPort = 3002, hostPort = 0, protocol = "tcp" }]
-      secrets = [
-        { name = "DB_HOST", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_HOST::" },
-        { name = "DB_USER", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_USER::" },
-        { name = "DB_PASSWORD", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_PASSWORD::" },
-        { name = "DB_NAME", valueFrom = "${aws_secretsmanager_secret.db_creds.arn}:DB_NAME::" }
-      ]
-      logConfiguration = { logDriver = "awslogs", options = { "awslogs-group" = "/ecs/technova", "awslogs-region" = "us-east-1", "awslogs-stream-prefix" = "ped" } }
-    }
-  ])
-}
-
-resource "aws_ecs_service" "app_service" {
-  name            = "srv-${var.alumno}"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = 2
-  launch_type     = "EC2"
-
-  depends_on = [
-    aws_lb_listener_rule.api_prod,
-    aws_lb_listener_rule.api_ped,
-    aws_lb_listener.http
-  ]
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.frontend.arn
-    container_name   = "frontend"
-    container_port   = 80
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.api_prod.arn
-    container_name   = "api-productos"
-    container_port   = 3001
-  }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.api_ped.arn
-    container_name   = "api-pedidos"
-    container_port   = 3002
+  error_document {
+    key = "index.html"
   }
 }
 
-# ------------------------------------------------------------------------------
-# 8. OUTPUTS (Para consumo de scripts y validación)
-# ------------------------------------------------------------------------------
-output "rds_endpoint" {
-  description = "Endpoint privado de MySQL para inyeccion via SSM"
-  value       = aws_db_instance.mysql.address
-}
+# CORS en S3: permite que el browser del usuario haga requests cross-origin al ALB
+# Nota: el CORS crítico es en las APIs Node.js (Access-Control-Allow-Origin)
+# Este CORS de S3 permite que otros orígenes descarguen assets del bucket
+resource "aws_s3_bucket_cors_configuration" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
 
-output "alb_dns_name" {
-  description = "URL publica del Balanceador de Carga"
-  value       = "http://${aws_lb.main.dns_name}"
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "HEAD"]
+    allowed_origins = ["*"]
+    expose_headers  = ["ETag"]
+    max_age_seconds = 3000
+  }
 }

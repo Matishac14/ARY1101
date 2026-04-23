@@ -1,55 +1,113 @@
 #!/bin/bash
 # ==============================================================================
-# SCRIPT 3: VALIDACIÓN TOTAL (ALB + RDS)
+# SCRIPT 03 — Validación completa de la POC TechNova
+# ARY1101 · Matias Fernandez
+# Uso: ./03_validate.sh
+# Valida: EC2, containers, RDS, ALB endpoints, S3 frontend
 # ==============================================================================
-REGION="us-east-1"
-ALUMNO="matias-fernandez"
+set -euo pipefail
 
-echo ">> 1. Extrayendo variables de Terraform..."
+REGION="us-east-1"
+PASS=0; FAIL=0
+
+check() {
+  local desc="$1"; local cmd="$2"; local expect="$3"
+  local result
+  result=$(eval "$cmd" 2>/dev/null || echo "ERROR")
+  if echo "$result" | grep -q "$expect"; then
+    echo "  ✅ $desc"
+    ((PASS++))
+  else
+    echo "  ❌ $desc → '$result'"
+    ((FAIL++))
+  fi
+}
+
+echo "========================================================"
+echo " TechNova POC — Validación Completa"
+echo "========================================================"
+
+echo ""
+echo ">> [1/6] Leyendo outputs Terraform..."
 ALB_URL=$(terraform output -raw alb_dns_name)
 RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
-INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=ec2-ecs-node-$ALUMNO" "Name=instance-state-name,Values=running" --region $REGION --query "Reservations[0].Instances[0].InstanceId" --output text)
+INSTANCE_ID=$(terraform output -raw ec2_instance_id)
+S3_URL=$(terraform output -raw s3_website_url)
+S3_BUCKET=$(terraform output -raw s3_bucket_name)
 
-echo "====================================================="
-echo ">> 2. VALIDANDO BALANCEADOR DE CARGA Y API (CAPA 7)"
-echo "====================================================="
-echo "Haciendo petición GET a: $ALB_URL/api/productos/info"
+echo "   ALB:    $ALB_URL"
+echo "   RDS:    $RDS_ENDPOINT"
+echo "   EC2:    $INSTANCE_ID"
+echo "   S3:     $S3_URL"
 
-# Manejo de error graceful para la dependencia 'jq'
-if command -v jq &> /dev/null; then
-    curl -s "$ALB_URL/api/productos/info" | jq
-else
-    echo "⚠️  [Advertencia]: 'jq' no está instalado. Mostrando salida JSON en crudo:"
-    curl -s "$ALB_URL/api/productos/info"
-    echo -e "\n(Tip: Instala jq con 'brew install jq' en tu Mac)"
-fi
 echo ""
+echo ">> [2/6] Estado EC2..."
+check "EC2 running" \
+  "aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $REGION --query 'Reservations[0].Instances[0].State.Name' --output text" \
+  "running"
 
-echo "====================================================="
-echo ">> 3. VALIDANDO POBLAMIENTO EN RDS (CAPA DATOS)"
-echo "====================================================="
-echo "Enviando consulta SQL vía SSM a través del EC2: $INSTANCE_ID..."
+check "SSM Agent online" \
+  "aws ssm describe-instance-information --filters 'Key=InstanceIds,Values=$INSTANCE_ID' --region $REGION --query 'InstanceInformationList[0].PingStatus' --output text" \
+  "Online"
 
-# Enviamos un comando que hace un SHOW TABLES y un SELECT a la tabla productos
-aws ssm send-command \
-    --document-name "AWS-RunShellScript" \
-    --targets "Key=InstanceIds,Values=$INSTANCE_ID" \
-    --parameters 'commands=["mysql -h '$RDS_ENDPOINT' -u admin -p20099194k -D tienda_12345678 -t -e \"SHOW TABLES; SELECT id, nombre, precio, stock FROM productos;\""]' \
-    --region $REGION \
-    --query "Command.CommandId" \
-    --output text > cmd_id.txt
+echo ""
+echo ">> [3/6] Containers Docker en EC2 (via SSM)..."
+CMD_ID=$(aws ssm send-command \
+  --document-name "AWS-RunShellScript" \
+  --targets "Key=InstanceIds,Values=$INSTANCE_ID" \
+  --parameters "commands=[\"docker ps --format '{{.Names}} {{.Status}}'\"]" \
+  --region "$REGION" \
+  --query "Command.CommandId" --output text)
+sleep 8
+DOCKER_OUT=$(aws ssm get-command-invocation \
+  --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+  --region "$REGION" --query "StandardOutputContent" --output text)
 
-CMD_ID=$(cat cmd_id.txt)
-echo "Esperando respuesta de RDS (5 segundos)..."
-sleep 5
+echo "$DOCKER_OUT"
+echo "$DOCKER_OUT" | grep -q "technova-api-productos" && \
+  { echo "  ✅ Container api-productos corriendo"; ((PASS++)); } || \
+  { echo "  ❌ Container api-productos NO encontrado"; ((FAIL++)); }
+echo "$DOCKER_OUT" | grep -q "technova-api-pedidos" && \
+  { echo "  ✅ Container api-pedidos corriendo"; ((PASS++)); } || \
+  { echo "  ❌ Container api-pedidos NO encontrado"; ((FAIL++)); }
 
-aws ssm get-command-invocation \
-    --command-id "$CMD_ID" \
-    --instance-id "$INSTANCE_ID" \
-    --region $REGION \
-    --query "StandardOutputContent" \
-    --output text
+echo ""
+echo ">> [4/6] RDS disponible..."
+check "RDS status available" \
+  "aws rds describe-db-instances --db-instance-identifier rds-matias-fernandez --region $REGION --query 'DBInstances[0].DBInstanceStatus' --output text" \
+  "available"
 
-rm cmd_id.txt
-echo "====================================================="
-echo "✅ VALIDACIÓN FINALIZADA."
+echo ""
+echo ">> [5/6] ALB endpoints (espera ~30s si recién levantó)..."
+for EP in "/api/productos/info" "/api/pedidos/info"; do
+  echo "  GET $ALB_URL$EP"
+  RESP=$(curl -sf --max-time 20 "$ALB_URL$EP" 2>/dev/null || echo "")
+  if [ -n "$RESP" ]; then
+    echo "  ✅ Respuesta: $RESP"
+    ((PASS++))
+  else
+    echo "  ❌ Sin respuesta en $EP"
+    ((FAIL++))
+  fi
+done
+
+echo ""
+echo ">> [6/6] Frontend S3..."
+S3_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$S3_URL" 2>/dev/null || echo "000")
+if [ "$S3_CODE" = "200" ]; then
+  echo "  ✅ Frontend S3 responde HTTP 200"
+  ((PASS++))
+else
+  echo "  ❌ Frontend S3 → HTTP $S3_CODE (espera 1 min si recién creado)"
+  ((FAIL++))
+fi
+
+echo ""
+echo "========================================================"
+echo " RESUMEN: $PASS pasaron | $FAIL fallaron"
+if [ "$FAIL" -eq 0 ]; then
+  echo " ✅ POC COMPLETAMENTE FUNCIONAL"
+else
+  echo " ⚠️  Revisar los items fallidos antes de la evaluación"
+fi
+echo "========================================================"
